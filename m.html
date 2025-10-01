@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini E-Learning Platform</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <!-- Load Firebase Modules -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let userProgress = {}; // Stores all progress data: { courseId: { completed: boolean, lessons: { lessonId: boolean } } }
+
+        // --- Core Data ---
+        const courses = [
+            {
+                id: 'js_fundamentals',
+                title: 'JavaScript Fundamentals',
+                description: 'A deep dive into the core concepts of modern JavaScript.',
+                lessons: [
+                    { id: 'js_intro', title: '1. Introduction to JS' },
+                    { id: 'js_vars', title: '2. Variables and Types' },
+                    { id: 'js_funcs', title: '3. Functions and Scope' },
+                    { id: 'js_async', title: '4. Asynchronous JS' },
+                ]
+            },
+            {
+                id: 'tailwind_css',
+                title: 'Tailwind CSS Mastery',
+                description: 'Learn utility-first CSS for rapid, responsive web development.',
+                lessons: [
+                    { id: 'tw_setup', title: '1. Installation and Setup' },
+                    { id: 'tw_responsive', title: '2. Responsive Design Utilities' },
+                    { id: 'tw_flex', title: '3. Flexbox and Grid' },
+                    { id: 'tw_components', title: '4. Building Custom Components' },
+                    { id: 'tw_dark', title: '5. Dark Mode Implementation' },
+                ]
+            },
+            {
+                id: 'firestore_basics',
+                title: 'Firestore Database Basics',
+                description: 'Understanding real-time, NoSQL database structures and queries.',
+                lessons: [
+                    { id: 'fs_connect', title: '1. Connecting to Firestore' },
+                    { id: 'fs_data', title: '2. Documents and Collections' },
+                    { id: 'fs_read', title: '3. Real-time Data with onSnapshot' },
+                    { id: 'fs_write', title: '4. Adding and Updating Data' },
+                ]
+            }
+        ];
+
+        let currentView = { name: 'home', data: null };
+        const appContainer = document.getElementById('app-container');
+        const progressDocId = 'progress_data'; // Single document to hold all progress
+
+        // --- Firebase Setup & Auth ---
+
+        /**
+         * Returns the Firestore document reference for the user's progress data.
+         * Structure: /artifacts/{appId}/users/{userId}/elearning_platform/progress_data
+         */
+        const getUserProgressRef = (dbInstance, currentUserId) => {
+            return doc(dbInstance, `artifacts/${appId}/users/${currentUserId}/elearning_platform`, progressDocId);
+        };
+
+        const initializeAppAndAuth = async () => {
+            try {
+                if (!firebaseConfig || !firebaseConfig.projectId) {
+                    console.error("Firebase config is missing or invalid. Using dummy data persistence.");
+                    document.getElementById('db-status').textContent = "Offline (No Firebase Config)";
+                    // Proceed with rendering using default data (userProgress = {})
+                    renderApp();
+                    return;
+                }
+
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('debug'); // Enable debug logging for Firestore
+
+                await setPersistence(auth, browserLocalPersistence);
+
+                // Sign in with provided token or anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('db-status').textContent = `Online (User: ${userId.substring(0, 8)}...)`;
+                        loadProgress();
+                    } else {
+                        userId = null;
+                        document.getElementById('db-status').textContent = "Logged out";
+                        // If logged out, progress defaults to empty, but we still render.
+                        userProgress = {};
+                        renderApp();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                document.getElementById('db-status').textContent = "Error during initialization";
+                // Render the app even if initialization fails
+                renderApp();
+            }
+        };
+
+        // --- Data Persistence (Firestore) ---
+
+        const loadProgress = () => {
+            if (!db || !userId) return;
+
+            const progressRef = getUserProgressRef(db, userId);
+
+            // Set up real-time listener for user progress
+            onSnapshot(progressRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    // Update local state with real-time data
+                    userProgress = docSnap.data().progress || {};
+                    console.log("Progress updated from Firestore:", userProgress);
+                } else {
+                    console.log("No progress data found. Initializing...");
+                    userProgress = {};
+                    // Create an initial empty document if it doesn't exist
+                    setDoc(progressRef, { progress: {} }).catch(e => console.error("Error setting initial progress:", e));
+                }
+                // Re-render the current view whenever progress updates
+                renderApp();
+            }, (error) => {
+                console.error("Error listening to progress data:", error);
+                document.getElementById('db-status').textContent = "Error loading progress";
+            });
+        };
+
+        const saveProgress = async (courseId, newCourseProgress) => {
+            if (!db || !userId) {
+                console.warn("Database or user not ready. Saving locally only.");
+                userProgress[courseId] = newCourseProgress;
+                renderApp();
+                return;
+            }
+
+            const progressRef = getUserProgressRef(db, userId);
+
+            try {
+                // Use a dynamic field path to update the specific course progress
+                await updateDoc(progressRef, {
+                    [`progress.${courseId}`]: newCourseProgress
+                });
+                console.log(`Progress saved successfully for course ${courseId}`);
+            } catch (e) {
+                console.error("Error saving progress:", e);
+                // Fallback: update local state on error
+                userProgress[courseId] = newCourseProgress;
+                renderApp();
+            }
+        };
+
+        // --- Core Logic ---
+
+        const getCourseById = (id) => courses.find(c => c.id === id);
+
+        const calculateProgress = (courseId) => {
+            const course = getCourseById(courseId);
+            if (!course) return 0;
+
+            const progress = userProgress[courseId] || { lessons: {} };
+            const totalLessons = course.lessons.length;
+
+            if (totalLessons === 0) return 100;
+
+            const completedLessons = course.lessons.filter(lesson => progress.lessons[lesson.id]).length;
+
+            return Math.floor((completedLessons / totalLessons) * 100);
+        };
+
+        const toggleLessonCompletion = async (courseId, lessonId) => {
+            const course = getCourseById(courseId);
+            if (!course) return;
+
+            // Initialize or get existing progress
+            const courseProgress = userProgress[courseId] || { completed: false, lessons: {} };
+            const newLessons = { ...courseProgress.lessons };
+
+            // Toggle the status
+            newLessons[lessonId] = !newLessons[lessonId];
+
+            const newProgress = {
+                ...courseProgress,
+                lessons: newLessons,
+                // Automatically un-complete the course if a lesson is un-completed
+                completed: false
+            };
+
+            await saveProgress(courseId, newProgress);
+        };
+
+        const toggleCourseCompletion = async (courseId) => {
+            const course = getCourseById(courseId);
+            if (!course) return;
+
+            const currentProgress = userProgress[courseId] || { completed: false, lessons: {} };
+            const isCurrentlyCompleted = currentProgress.completed;
+            const newCompletionStatus = !isCurrentlyCompleted;
+
+            let newLessons = { ...currentProgress.lessons };
+
+            // If marking as complete, ensure all lessons are marked as complete
+            if (newCompletionStatus) {
+                course.lessons.forEach(lesson => {
+                    newLessons[lesson.id] = true;
+                });
+            }
+
+            const newProgress = {
+                completed: newCompletionStatus,
+                lessons: newLessons
+            };
+
+            await saveProgress(courseId, newProgress);
+        };
+
+        // --- Navigation and Rendering ---
+
+        window.navigateTo = (view, data) => {
+            currentView = { name: view, data: data };
+            window.history.pushState(currentView, '', `#${view}${data ? '/' + data : ''}`);
+            renderApp();
+        };
+
+        const handlePopState = (event) => {
+            if (event.state) {
+                currentView = event.state;
+            } else {
+                // Read from URL hash if state is missing
+                const hash = window.location.hash.slice(1);
+                const [view, data] = hash.split('/');
+                currentView = { name: view || 'home', data: data || null };
+            }
+            renderApp();
+        };
+
+        const renderApp = () => {
+            let content = '';
+
+            if (currentView.name === 'course-detail' && currentView.data) {
+                content = renderCourseDetail(currentView.data);
+            } else {
+                content = renderHome();
+            }
+
+            appContainer.innerHTML = content;
+        };
+
+        // --- View Rendering Functions ---
+
+        const renderHome = () => {
+            const courseCards = courses.map(course => {
+                const progress = calculateProgress(course.id);
+                const isCompleted = userProgress[course.id]?.completed || false;
+                const completionBadge = isCompleted
+                    ? '<span class="ml-auto inline-flex items-center rounded-full bg-emerald-100 px-3 py-0.5 text-sm font-medium text-emerald-800"><svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>Completed</span>'
+                    : `<span class="ml-auto text-sm font-medium text-gray-500">${progress}% Complete</span>`;
+
+                return `
+                    <div onclick="navigateTo('course-detail', '${course.id}')"
+                         class="bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 cursor-pointer border-t-4 border-indigo-500 hover:border-indigo-600">
+                        <div class="flex items-start justify-between">
+                            <h2 class="text-xl font-semibold text-gray-900">${course.title}</h2>
+                            ${completionBadge}
+                        </div>
+                        <p class="mt-2 text-gray-600 text-sm">${course.description}</p>
+                        <div class="mt-4">
+                            <div class="w-full bg-gray-200 rounded-full h-2.5">
+                                <div class="bg-indigo-500 h-2.5 rounded-full" style="width: ${progress}%"></div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+                    <h1 class="text-3xl font-bold text-gray-900 mb-6">Available Courses</h1>
+                    <div class="space-y-6">
+                        ${courseCards}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderCourseDetail = (courseId) => {
+            const course = getCourseById(courseId);
+            if (!course) {
+                return '<div class="text-center p-8 text-red-500">Course not found.</div>';
+            }
+
+            const progress = calculateProgress(courseId);
+            const isCourseCompleted = userProgress[courseId]?.completed || false;
+            const courseProgress = userProgress[courseId] || { lessons: {} };
+
+            const lessonsList = course.lessons.map(lesson => {
+                const isLessonCompleted = courseProgress.lessons[lesson.id] || false;
+                const icon = isLessonCompleted
+                    ? '<svg class="w-5 h-5 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+                    : '<svg class="w-5 h-5 text-gray-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-3-3v6m-9-6a9 9 0 1118 0 9 9 0 01-18 0z"></path></svg>';
+                const textStyle = isLessonCompleted ? 'text-gray-700 line-through' : 'text-gray-900';
+                const buttonText = isLessonCompleted ? 'Mark as Incomplete' : 'Mark as Complete';
+                const buttonClass = isLessonCompleted ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-indigo-500 hover:bg-indigo-600';
+
+                return `
+                    <li class="flex items-center justify-between p-4 bg-gray-50 rounded-lg shadow-sm">
+                        <div class="flex items-center space-x-3">
+                            ${icon}
+                            <span class="font-medium ${textStyle}">${lesson.title}</span>
+                        </div>
+                        <button onclick="event.stopPropagation(); window.toggleLessonCompletion('${courseId}', '${lesson.id}')"
+                                class="px-3 py-1 text-sm font-medium text-white rounded-md transition duration-150 ease-in-out ${buttonClass} focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            ${buttonText}
+                        </button>
+                    </li>
+                `;
+            }).join('');
+
+            const completionButtonText = isCourseCompleted ? 'Course Completed (Click to Undo)' : 'Mark Course as Completed';
+            const completionButtonClass = isCourseCompleted
+                ? 'bg-emerald-500 hover:bg-emerald-600 focus:ring-emerald-500'
+                : 'bg-green-500 hover:bg-green-600 focus:ring-green-500';
+
+            return `
+                <div class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+                    <!-- Header and Back Button -->
+                    <div class="mb-8 flex items-center justify-between">
+                        <button onclick="navigateTo('home')"
+                                class="flex items-center text-indigo-600 hover:text-indigo-800 font-medium transition duration-150">
+                            <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                            Back to Courses
+                        </button>
+                    </div>
+
+                    <!-- Course Info -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg mb-8 border-t-4 border-indigo-500">
+                        <h1 class="text-3xl font-bold text-gray-900">${course.title}</h1>
+                        <p class="mt-2 text-lg text-gray-600">${course.description}</p>
+
+                        <!-- Progress Bar -->
+                        <div class="mt-5">
+                            <h3 class="text-sm font-medium text-gray-700 mb-1">Overall Progress: ${progress}%</h3>
+                            <div class="w-full bg-gray-200 rounded-full h-3">
+                                <div class="bg-indigo-500 h-3 rounded-full transition-all duration-500" style="width: ${progress}%"></div>
+                            </div>
+                        </div>
+
+                        <!-- Mark Course as Completed Button -->
+                        <div class="mt-6">
+                            <button onclick="window.toggleCourseCompletion('${courseId}')"
+                                    class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-base font-medium text-white transition duration-150 ease-in-out ${completionButtonClass} focus:outline-none focus:ring-2 focus:ring-offset-2">
+                                ${completionButtonText}
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Lessons List -->
+                    <h2 class="text-2xl font-semibold text-gray-900 mb-4">Lessons</h2>
+                    <ul class="space-y-3">
+                        ${lessonsList}
+                    </ul>
+                </div>
+            `;
+        };
+
+        // --- Initialization ---
+        window.addEventListener('load', () => {
+            // Expose logic functions globally for use in HTML onclick attributes
+            window.toggleLessonCompletion = toggleLessonCompletion;
+            window.toggleCourseCompletion = toggleCourseCompletion;
+
+            // Handle initial view load from URL hash
+            const hash = window.location.hash.slice(1);
+            if (hash) {
+                const [view, data] = hash.split('/');
+                currentView = { name: view, data: data };
+            }
+
+            // Set up history listener for back/forward navigation
+            window.addEventListener('popstate', handlePopState);
+
+            // Start Firebase initialization
+            initializeAppAndAuth();
+        });
+
+    </script>
+    <style>
+        /* Custom styles for clean aesthetic and hover effects */
+        .hover\:shadow-xl {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        [onclick] {
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen font-sans">
+    <header class="bg-white shadow-md">
+        <div class="max-w-7xl mx-auto py-4 px-4 sm:px-6 lg:px-8 flex justify-between items-center">
+            <h1 class="text-2xl font-extrabold text-indigo-600">eLearning Pro</h1>
+            <p id="db-status" class="text-sm text-gray-500 transition duration-300">Connecting...</p>
+        </div>
+    </header>
+
+    <main id="app-container" class="pb-10">
+        <!-- Content will be injected here by JavaScript -->
+        <div class="text-center p-20 text-gray-500">
+            <svg class="animate-spin h-8 w-8 text-indigo-500 mx-auto mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            Loading Application...
+        </div>
+    </main>
+
+</body>
+</html>
